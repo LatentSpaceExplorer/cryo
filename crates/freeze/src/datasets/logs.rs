@@ -21,6 +21,7 @@ pub struct Logs {
     n_data_bytes: Vec<u32>,
     event_cols: indexmap::IndexMap<String, Vec<ethers_core::abi::Token>>,
     chain_id: Vec<u64>,
+    timestamp: Vec<u32>,
 }
 
 #[async_trait::async_trait]
@@ -63,34 +64,44 @@ impl Dataset for Logs {
 
 #[async_trait::async_trait]
 impl CollectByBlock for Logs {
-    type Response = Vec<Log>;
+    type Response = (Vec<Log>, u32);
 
     async fn extract(request: Params, source: Arc<Source>, _: Arc<Query>) -> R<Self::Response> {
-        source.get_logs(&request.ethers_log_filter()?).await
+        let logs = source.get_logs(&request.ethers_log_filter()?).await?;
+
+        // if block range is not a single block raise panic
+        if request.block_range()?.0 != request.block_range()?.1 {
+            panic!("block range start and end must be the same");
+        }
+
+        let block = source.get_block(request.block_range()?.0).await?;
+        let timestamp = block.unwrap().timestamp.as_u32();
+        Ok((logs, timestamp))
     }
 
     fn transform(response: Self::Response, columns: &mut Self, query: &Arc<Query>) -> R<()> {
         let schema = query.schemas.get_schema(&Datatype::Logs)?;
-        process_logs(response, columns, schema)
+        process_logs(response.0, response.1, columns, schema)
     }
 }
 
 #[async_trait::async_trait]
 impl CollectByTransaction for Logs {
-    type Response = Vec<Log>;
+    type Response = (Vec<Log>, u32);
 
     async fn extract(request: Params, source: Arc<Source>, _: Arc<Query>) -> R<Self::Response> {
-        source.get_transaction_logs(request.transaction_hash()?).await
+        let _logs = source.get_transaction_logs(request.transaction_hash()?).await?;
+        todo!()
     }
 
     fn transform(response: Self::Response, columns: &mut Self, query: &Arc<Query>) -> R<()> {
         let schema = query.schemas.get_schema(&Datatype::Logs)?;
-        process_logs(response, columns, schema)
+        process_logs(response.0, response.1, columns, schema)
     }
 }
 
 /// process block into columns
-fn process_logs(logs: Vec<Log>, columns: &mut Logs, schema: &Table) -> R<()> {
+fn process_logs(logs: Vec<Log>, timestamp: u32, columns: &mut Logs, schema: &Table) -> R<()> {
     let decode_keys = match &schema.log_decoder {
         None => None,
         Some(decoder) => {
@@ -132,6 +143,7 @@ fn process_logs(logs: Vec<Log>, columns: &mut Logs, schema: &Table) -> R<()> {
             store!(schema, columns, address, log.address.as_bytes().to_vec());
             store!(schema, columns, data, log.data.to_vec());
             store!(schema, columns, n_data_bytes, log.data.len() as u32);
+            store!(schema, columns, timestamp, timestamp);
 
             // topics
             for i in 0..4 {
