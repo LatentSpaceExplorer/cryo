@@ -24,6 +24,7 @@ pub struct Logs {
     n_data_bytes: Vec<u32>,
     event_cols: indexmap::IndexMap<String, Vec<DynSolValue>>,
     chain_id: Vec<u64>,
+    timestamp: Vec<u32>,
 }
 
 #[async_trait::async_trait]
@@ -171,6 +172,7 @@ fn process_logs(logs: Vec<Log>, columns: &mut Logs, schema: &Table) -> R<()> {
             store!(schema, columns, address, log.address().to_vec());
             store!(schema, columns, data, log.data().data.to_vec());
             store!(schema, columns, n_data_bytes, log.data().data.len() as u32);
+            store!(schema, columns, timestamp, log.block_timestamp.unwrap_or_default() as u32);
 
             // topics
             for i in 0..4 {
