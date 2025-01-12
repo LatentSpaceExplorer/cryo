@@ -1,5 +1,8 @@
 use crate::*;
-use ethers::prelude::*;
+use alloy::{
+    dyn_abi::{DynSolType, DynSolValue, EventExt},
+    rpc::types::Log,
+};
 use polars::prelude::*;
 
 /// columns for transactions
@@ -19,9 +22,8 @@ pub struct Logs {
     topic3: Vec<Option<Vec<u8>>>,
     data: Vec<Vec<u8>>,
     n_data_bytes: Vec<u32>,
-    event_cols: indexmap::IndexMap<String, Vec<ethers_core::abi::Token>>,
+    event_cols: indexmap::IndexMap<String, Vec<DynSolValue>>,
     chain_id: Vec<u64>,
-    timestamp: Vec<u32>,
 }
 
 #[async_trait::async_trait]
@@ -64,55 +66,65 @@ impl Dataset for Logs {
 
 #[async_trait::async_trait]
 impl CollectByBlock for Logs {
-    type Response = (Vec<Log>, u32);
+    type Response = Vec<Log>;
 
     async fn extract(request: Params, source: Arc<Source>, _: Arc<Query>) -> R<Self::Response> {
-        let logs = source.get_logs(&request.ethers_log_filter()?).await?;
-
-        // if block range is not a single block raise panic
-        if request.block_range()?.0 != request.block_range()?.1 {
-            panic!("block range start and end must be the same");
-        }
-
-        let block = source.get_block(request.block_range()?.0).await?;
-        let timestamp = block.unwrap().timestamp.as_u32();
-        Ok((logs, timestamp))
+        source.get_logs(&request.ethers_log_filter()?).await
     }
 
     fn transform(response: Self::Response, columns: &mut Self, query: &Arc<Query>) -> R<()> {
         let schema = query.schemas.get_schema(&Datatype::Logs)?;
-        process_logs(response.0, response.1, columns, schema)
+        process_logs(response, columns, schema)
     }
 }
 
 #[async_trait::async_trait]
 impl CollectByTransaction for Logs {
-    type Response = (Vec<Log>, u32);
+    type Response = Vec<Log>;
 
     async fn extract(request: Params, source: Arc<Source>, _: Arc<Query>) -> R<Self::Response> {
-        let _logs = source.get_transaction_logs(request.transaction_hash()?).await?;
-        todo!()
+        source.get_transaction_logs(request.transaction_hash()?).await
     }
 
     fn transform(response: Self::Response, columns: &mut Self, query: &Arc<Query>) -> R<()> {
         let schema = query.schemas.get_schema(&Datatype::Logs)?;
-        process_logs(response.0, response.1, columns, schema)
+        process_logs(response, columns, schema)
     }
 }
 
 /// process block into columns
-fn process_logs(logs: Vec<Log>, timestamp: u32, columns: &mut Logs, schema: &Table) -> R<()> {
-    let decode_keys = match &schema.log_decoder {
-        None => None,
+fn process_logs(logs: Vec<Log>, columns: &mut Logs, schema: &Table) -> R<()> {
+    // let decode_keys = match &schema.log_decoder {
+    //     None => None,
+    //     Some(decoder) => {
+    //         let keys = decoder
+    //             .event
+    //             .inputs
+    //             .clone()
+    //             .into_iter()
+    //             .map(|i| i.name)
+    //             .collect::<std::collections::HashSet<String>>();
+    //         Some(keys)
+    //     }
+    // };
+    let (indexed_keys, body_keys) = match &schema.log_decoder {
+        None => (None, None),
         Some(decoder) => {
-            let keys = decoder
+            let indexed: Vec<String> = decoder
                 .event
                 .inputs
                 .clone()
                 .into_iter()
-                .map(|i| i.name)
-                .collect::<std::collections::HashSet<String>>();
-            Some(keys)
+                .filter_map(|x| if x.indexed { Some(x.name) } else { None })
+                .collect();
+            let body: Vec<String> = decoder
+                .event
+                .inputs
+                .clone()
+                .into_iter()
+                .filter_map(|x| if x.indexed { None } else { Some(x.name) })
+                .collect();
+            (Some(indexed), Some(body))
         }
     };
 
@@ -121,13 +133,29 @@ fn process_logs(logs: Vec<Log>, timestamp: u32, columns: &mut Logs, schema: &Tab
             (log.block_number, log.transaction_hash, log.transaction_index, log.log_index)
         {
             // decode event
-            if let (Some(decoder), Some(decode_keys)) = (&schema.log_decoder, &decode_keys) {
-                match decoder.event.parse_log(log.clone().into()) {
+            if let (Some(decoder), Some(indexed_keys), Some(body_keys)) =
+                (&schema.log_decoder, &indexed_keys, &body_keys)
+            {
+                match decoder.event.decode_log(&log.inner.data, true) {
                     Ok(log) => {
-                        for param in log.params {
-                            if decode_keys.contains(param.name.as_str()) {
-                                columns.event_cols.entry(param.name).or_default().push(param.value);
-                            }
+                        // for param in log.indexed {
+                        //     if decode_keys.contains(param.name.as_str()) {
+                        //         columns.event_cols.entry(param.name).or_default().push(param.
+                        // value);     }
+                        // }
+                        for (idx, indexed_param) in log.indexed.into_iter().enumerate() {
+                            columns
+                                .event_cols
+                                .entry(indexed_keys[idx].clone())
+                                .or_default()
+                                .push(indexed_param);
+                        }
+                        for (idx, body_param) in log.body.into_iter().enumerate() {
+                            columns
+                                .event_cols
+                                .entry(body_keys[idx].clone())
+                                .or_default()
+                                .push(body_param);
                         }
                     }
                     Err(_) => continue,
@@ -135,23 +163,19 @@ fn process_logs(logs: Vec<Log>, timestamp: u32, columns: &mut Logs, schema: &Tab
             };
 
             columns.n_rows += 1;
-            store!(schema, columns, block_number, bn.as_u32());
-            store!(schema, columns, block_hash, log.block_hash.map(|bh| bh.as_bytes().to_vec()));
-            store!(schema, columns, transaction_index, ti.as_u32());
-            store!(schema, columns, log_index, li.as_u32());
-            store!(schema, columns, transaction_hash, tx.as_bytes().to_vec());
-            store!(schema, columns, address, log.address.as_bytes().to_vec());
-            store!(schema, columns, data, log.data.to_vec());
-            store!(schema, columns, n_data_bytes, log.data.len() as u32);
-            store!(schema, columns, timestamp, timestamp);
+            store!(schema, columns, block_number, bn as u32);
+            store!(schema, columns, block_hash, log.block_hash.map(|bh| bh.to_vec()));
+            store!(schema, columns, transaction_index, ti as u32);
+            store!(schema, columns, log_index, li as u32);
+            store!(schema, columns, transaction_hash, tx.to_vec());
+            store!(schema, columns, address, log.address().to_vec());
+            store!(schema, columns, data, log.data().data.to_vec());
+            store!(schema, columns, n_data_bytes, log.data().data.len() as u32);
 
             // topics
             for i in 0..4 {
-                let topic = if i < log.topics.len() {
-                    Some(log.topics[i].as_bytes().to_vec())
-                } else {
-                    None
-                };
+                let topic =
+                    if i < log.topics().len() { Some(log.topics()[i].to_vec()) } else { None };
                 match i {
                     0 => store!(schema, columns, topic0, topic),
                     1 => store!(schema, columns, topic1, topic),
